@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Stereo channel alignment.** `EstimateChannelDelay`, `AlignStereo`,
+  `NewAlignedStereo` (with `AlignedStereo.Process`/`ProcessInto`/`Flush`) and
+  `AlignedLateness` estimate and remove the inter-channel delay of a
+  two-microphone stereo pair before or while resampling. A pair captured with a
+  few frames' offset combs when summed or downmixed, and resampling cannot fix
+  that because the channels differ in time, not in rate. The estimator is a
+  windowed, mean-removed, normalized cross-correlation over a bounded lag
+  search, refined to a fraction of a sample with a band-limited (Lanczos)
+  interpolant; it reports a confidence in [0, 1] and an in-phase/inverted
+  polarity marker. The streaming entry point keeps the estimate, both
+  alignment filters and both resamplers' state across blocks: re-estimation
+  runs at absolute stream positions every `Window` samples, so a fixed input
+  produces the same output for every chunk size
+  (`TestAlignedStereo_StreamingEquivalence`). A silent analysis window raises
+  `ErrAlignSilent`/`Silent`, unrelated channels `ErrAlignUnreliable`, and a
+  delay at the search bound `ErrAlignOutOfRange`; in each case the previous
+  alignment is kept and never fitted to noise. Alignment happens at the input
+  rate and adds neither samples nor frames; both channels carry the same
+  `AlignedLateness()`-sample delay, so the pair's timeline shifts while the
+  two channels stay aligned to each other, and `AlignedStereo.Latency` is the
+  underlying resampler's startup deficit (the alignment withholds no
+  samples). Accuracy is
+  pinned against a committed public-domain real stereo excerpt
+  (`internal/align/testdata`) and synthetic band-limited signals: fractional
+  delays are recovered to within a few hundredths of a sample.
+- `examples/align` shows the estimate-then-stream workflow, including the
+  delay-free result and the unchanged output length.
+
 ### Fixed
 
 - `New` no longer drops the rate change for conversions within 0.1% of 1:1 or

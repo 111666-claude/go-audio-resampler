@@ -41,6 +41,7 @@ The library implements polyphase FIR filtering with Kaiser window design for pro
 - [Precision Modes (float32 vs float64)](#precision-modes-float32-vs-float64)
 - [Architecture](#architecture)
 - [API Reference](#api-reference)
+- [Stereo Channel Alignment](#stereo-channel-alignment)
 - [Command-Line Tools](#command-line-tools)
 - [Performance](#performance)
 - [Dependencies](#dependencies)
@@ -62,6 +63,7 @@ The library implements polyphase FIR filtering with Kaiser window design for pro
 - **Parallel channel processing** - ~1.7x speedup for stereo, up to 8x for 7.1 surround audio
 - **Streaming API** - Process audio in chunks with proper state management
 - **Zero-allocation streaming** - Caller-owned output buffers (`ProcessInto` / `ProcessFloat32Into`) for float32 and float64 hot paths
+- **Stereo channel alignment** - Estimates and removes the inter-channel delay of two-microphone captures before resampling
 - **soxr-quality algorithms** - Implements libsoxr's multi-stage architecture for professional-grade quality
 
 ## Installation
@@ -295,6 +297,105 @@ interleaved := resampling.InterleaveToStereo(left, right)
 left, right := resampling.DeinterleaveFromStereo(interleaved)
 ```
 
+### Stereo Channel Alignment
+
+Two microphones recording the same performance are rarely sample-aligned: the
+capsule spacing, separate converters and different preamp latencies each shift
+one channel against the other by an integer or fractional number of samples.
+Summing or downmixing such a pair comb-filters the result — a delay of `d`
+samples cancels the shared content where `d*f` is a half-integer cycle — and
+resampling does not fix it, because the channels drift apart in time, not in
+rate. Align first, then resample.
+
+`EstimateChannelDelay` reports the delay of right relative to left, with a
+confidence and a polarity flag:
+
+```go
+res, err := resampling.EstimateChannelDelay(left, right, resampling.AlignConfig{MaxDelay: 64})
+switch {
+case errors.Is(err, resampling.ErrAlignSilent):
+    // no signal in the window; leave the pair alone
+case errors.Is(err, resampling.ErrAlignUnreliable):
+    // the channels do not share a source (confidence below MinAlignConfidence)
+case errors.Is(err, resampling.ErrAlignOutOfRange):
+    // the delay is at least MaxDelay; widen the search
+case err != nil:
+    log.Fatal(err)
+default:
+    fmt.Printf("right lags left by %.3f samples (confidence %.2f)\n", res.Delay, res.Confidence)
+}
+```
+
+`AlignStereo` does the estimate and the shift in one call, for a pair that is
+already in memory:
+
+```go
+alignedLeft, alignedRight, res, err := resampling.AlignStereo(left, right, resampling.AlignConfig{MaxDelay: 64})
+```
+
+`AlignedStereo` is the streaming entry point: it keeps the alignment, its
+filters and both resamplers' state between blocks, so a fixed input produces
+the same output for every chunk size. It aligns at the input rate and then
+resamples the aligned pair:
+
+```go
+s, err := resampling.NewAlignedStereo(48000, 44100, resampling.QualityHigh,
+    resampling.AlignConfig{MaxDelay: 64})
+if err != nil {
+    log.Fatal(err)
+}
+for chunk := range stereoChunks { // corresponding frames of both channels
+    outL, outR, res, err := s.Process(chunk.left, chunk.right)
+    if err != nil {
+        log.Fatal(err)
+    }
+    // res.Valid() reports whether the alignment is currently trustworthy
+    writeOutput(outL, outR)
+}
+tailL, tailR, _, err := s.Flush() // once, at end of stream
+```
+
+Behaviour that matters in practice:
+
+- **A fixed input does not depend on the chunk size.** Re-estimation happens at
+  absolute stream positions (every `Window` samples), using the same analysis
+  history regardless of where the caller split the input, and the aligners'
+  state is carried across blocks. `TestAlignedStereo_StreamingEquivalence`
+  feeds the same input in 1-, 7-, 333- and 4096-sample chunks and compares the
+  output sample for sample.
+- **Silence never invents a delay.** A block whose analysis window is below
+  `SilenceRMS` (default `-80 dBFS`) is reported as `Silent` and the previous
+  alignment is kept, so dither or room noise cannot move it.
+- **Unrelated channels are not "aligned".** Below `MinAlignConfidence` (0.2)
+  the estimate is reported as unreliable and not applied.
+- **A delay past `MaxDelay` is reported, not truncated.**
+  `ErrAlignOutOfRange` / `OutOfRange` means the peak lay at the search edge or
+  a stronger peak was found just past it; widen `MaxDelay` instead of applying
+  a clipped shift.
+- **Polarity is reported, not corrected.** `AlignResult.Polarity` is `-1` when
+  one channel is the other's inverse; the caller decides whether to invert it.
+- **Timing.** Both channels receive a common 64-sample delay (the kernel's
+  group delay), and the early channel receives the inter-channel offset on top
+  of it, so the pair's timeline is shifted by `AlignedLateness()` input
+  samples while the two channels stay aligned to each other. The stage withholds
+  no samples: `AlignedStereo.Latency()` equals the underlying resampler's
+  startup deficit, and a real-time FIFO is primed with it plus
+  `AlignedLateness()*ratio` output samples of silence if the absolute timeline
+  must be preserved.
+- **Length.** Alignment neither adds nor drops frames: N input samples give
+  the aligned pair N samples, and the output length is the resampler's usual
+  one for N input samples.
+- `Freeze: true` locks the first usable estimate for the whole stream, for a
+  fixed rig where a later quiet passage must not perturb the alignment.
+
+The estimator is a windowed, mean-removed, normalized cross-correlation over a
+bounded lag search, refined to a fraction of a sample by interpolating the
+correlation sequence with a band-limited (Lanczos) kernel. On the committed
+real-stereo excerpt (`internal/align/testdata`) and on synthetic broadband
+material it recovers a fractional delay to within a few hundredths of a sample
+— far below the pitch period of any audible tone, so the comb filter is removed
+rather than moved.
+
 ### Multi-Channel Streaming
 
 When streaming multi-channel audio with `ProcessMulti`, drain with `FlushMulti`
@@ -481,6 +582,51 @@ type Config struct {
     EnableSIMD     bool         // Enable SIMD optimizations
     EnableParallel bool         // Enable parallel channel processing
 }
+```
+
+### Stereo Alignment Types
+
+```go
+// Alignment configuration, shared by the estimate and the streaming entry point.
+type AlignConfig struct {
+    MaxDelay   int     // largest inter-channel delay searched, in samples
+    Window     int     // analysis window; 0 = DefaultAlignWindow (16384)
+    SilenceRMS float64 // below this block RMS no estimate is made; 0 = -80 dBFS
+    Freeze     bool    // lock the first usable estimate for the stream
+}
+
+// Outcome of a delay estimate.
+type AlignResult struct {
+    Delay      float64 // right relative to left, in samples (fractional)
+    Confidence float64 // absolute normalized correlation at Delay, in [0,1]
+    Polarity   float64 // +1 in phase, -1 inverted
+    Silent     bool    // analysis window was silence; alignment unchanged
+    OutOfRange bool    // delay at or beyond MaxDelay; do not apply
+}
+
+// Stateless estimate and one-shot alignment.
+func EstimateChannelDelay(left, right []float64, cfg AlignConfig) (AlignResult, error)
+func AlignStereo(left, right []float64, cfg AlignConfig) (alignedLeft, alignedRight []float64, res AlignResult, err error)
+
+// Streaming align-and-resample stage.
+type AlignedStereo struct { /* ... */ }
+func NewAlignedStereo(inputRate, outputRate float64, quality QualityPreset, cfg AlignConfig) (*AlignedStereo, error)
+func (a *AlignedStereo) Process(left, right []float64) (leftOut, rightOut []float64, res AlignResult, err error)
+func (a *AlignedStereo) ProcessInto(left, right, leftOut, rightOut []float64) (int, AlignResult, error)
+func (a *AlignedStereo) Flush() (leftOut, rightOut []float64, res AlignResult, err error)
+func (a *AlignedStereo) Latency() int
+func (a *AlignedStereo) Alignment() (AlignResult, bool)
+func (a *AlignedStereo) EstimateOutput(inputLen int) int
+func (a *AlignedStereo) Reset()
+func (a *AlignedStereo) GetRatio() float64
+
+// Sentinel errors: the estimate is reported, the alignment is left unchanged.
+var (
+    ErrAlignSilent     = errors.New(...) // no signal in the window
+    ErrAlignUnreliable = errors.New(...) // channels correlate below MinAlignConfidence
+    ErrAlignOutOfRange = errors.New(...) // delay at or beyond MaxDelay
+    ErrAlignShortWindow = errors.New(...)
+)
 ```
 
 ### Getting Resampler Info

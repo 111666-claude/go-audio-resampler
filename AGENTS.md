@@ -14,16 +14,17 @@ Packages:
 
 | Package | Role |
 |---|---|
-| `resampler` (root) | Public API: `Config`, `QualitySpec`, presets, `New`, `Resampler`, `MultiFlusher`, `SimpleResampler` and `SimpleResamplerFloat32`, `ResampleMono[Float32]`, `ResampleStereo[Float32]`, convenience constructors, interleave helpers, `GetInfo`, `NewEngine`/`NewEngineFloat32`, `GetPresetSpec`, and the pipeline types `Pipeline`, `StageSpec`, `Stage`, `RingBuffer` |
+| `resampler` (root) | Public API: `Config`, `QualitySpec`, presets, `New`, `Resampler`, `MultiFlusher`, `SimpleResampler` and `SimpleResamplerFloat32`, `ResampleMono[Float32]`, `ResampleStereo[Float32]`, convenience constructors, interleave helpers, `GetInfo`, `NewEngine`/`NewEngineFloat32`, `GetPresetSpec`, the pipeline types `Pipeline`, `StageSpec`, `Stage`, `RingBuffer`, and stereo alignment (`AlignConfig`, `AlignResult`, `EstimateChannelDelay`, `AlignStereo`, `AlignedStereo`, `AlignedLateness`) |
 | `internal/engine` | The resampling algorithms: DFT stage (with a half-band fast path), polyphase and cubic stages, the single-ratio `Resampler`, filter parameters, stage adapter |
 | `internal/pipeline` | Stage interface and the multi-stage pipeline, buffers, zero-copy processing |
 | `internal/filter` | Kaiser-window low-pass filter design |
 | `internal/mathutil` | Bessel I0, Kaiser beta, filter length estimation, shared constants |
 | `internal/simdops` | SIMD dot products and the fused cubic polyphase kernel: AVX+FMA (amd64) and NEON (arm64) assembly, pure-Go fallback elsewhere |
+| `internal/align` | Stereo inter-channel delay estimation (windowed normalized cross-correlation with a band-limited sub-sample peak refinement), the fractional-delay kernel bank, and the streaming alignment session whose re-estimation schedule is anchored to absolute stream position |
 | `internal/testutil` | Shared test helpers |
 | `cmd/resample-wav` | CLI: resample a WAV file |
 | `cmd/resample` | Demo and benchmark tool |
-| `examples/basic`, `examples/streaming` | Runnable examples; `streaming` shows the real-time FIFO pattern |
+| `examples/basic`, `examples/streaming`, `examples/align` | Runnable examples; `streaming` shows the real-time FIFO pattern, `align` the estimate-then-resample workflow |
 | `rules` | gocritic ruleguard matchers (lint-only) |
 | `test-reference` | C programs and data generators that need libsoxr; not part of the Go build |
 
@@ -79,6 +80,7 @@ Tests run without audio hardware. Tests that need libsoxr reference data skip wh
 - **Regression tests.** New behaviour gets a test. A bug fix gets a regression test that fails before the fix. A test must be able to fail: break the line it pins and confirm.
 - **Quality suite.** `internal/engine` holds the quality-regression, preset-comparison, anti-aliasing, soxr-comparison and severe-ratio tests; `TestQualityRegression_THD` and `TestQualityRegression_THD_ActiveInterpolation` back the README numbers. If a README table changes, the test that backs it changes with it.
 - **Streaming tests.** Root-package tests cover flush lifecycle, multi-stage and multi-channel flush, flush length, chunking equivalence (`streaming_equivalence_test.go`), latency, `ProcessInto`, aliasing and parallel use.
+- **Stereo alignment tests.** `internal/align` covers the estimator (fractional accuracy, silence, polarity, noise, out-of-range, real public-domain material under `testdata/`), the delay kernel (flat passband, exact phase delay, chunk-size invariance) and the streaming session (chunk-size invariance, silence holding the alignment, freeze, malformed input); root `align_test.go` pins the public contract, including `ProcessInto`'s no-state-on-failure rule and the streaming/one-shot equivalence. Alignment output is compared sample for sample across chunkings, so a change to the estimate schedule, the history handling or the kernel must keep it exact.
 - **Fuzzing.** `FuzzResamplerNew` and `FuzzResampleMono` (root), `FuzzDesignLowPassFilter` and `FuzzKaiserWindow` (`internal/filter`), `FuzzBesselI0`, `FuzzKaiserBeta`, `FuzzKaiserBetaWithTrBw` and `FuzzEstimateFilterLength` (`internal/mathutil`). A `-fuzz` pattern that matches nothing passes without running, so run a new target in the package that defines it. Crashers are committed under `testdata/fuzz`. CI does not run fuzzing.
 - **Race.** `go test -race` covers the parallel channel path; keep new concurrency tests race-clean.
 - **Benchmarks.** Benchmarks live beside the code (`internal/engine`, `internal/simdops`, root). Hot paths (convolution, the cubic kernel, `ProcessInto`) are allocation-sensitive; compare before and after with `task bench`. CI runs benchstat on pull requests and posts the comparison.

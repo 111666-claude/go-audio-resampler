@@ -19,6 +19,7 @@
 //   - Multi-channel support for stereo, surround, and multi-channel audio (up to 256 channels)
 //   - Parallel channel processing for ~1.7x speedup on stereo, up to 8x on 7.1 surround
 //   - Streaming API for processing audio in chunks with proper state management
+//   - Stereo channel alignment for two-microphone captures whose channels are offset by a few frames
 //   - Quality validated against libsoxr reference implementation
 //
 // # Quick Start
@@ -254,6 +255,47 @@
 // Helper functions [InterleaveToStereo] and [DeinterleaveFromStereo] are provided
 // for converting between interleaved and planar audio formats. Float32 variants
 // [InterleaveToStereoFloat32] and [DeinterleaveFromStereoFloat32] are also available.
+//
+// # Stereo Channel Alignment
+//
+// Two microphones recording the same source are rarely sample-aligned: capsule
+// spacing, separate converters and different preamp latencies shift one
+// channel against the other by an integer or fractional number of samples.
+// Summing or downmixing such a pair comb-filters it, and resampling does not
+// fix that because the channels differ in time, not in rate: align first.
+//
+// [EstimateChannelDelay] reports the delay of the right channel relative to the
+// left, a confidence and a polarity flag. [AlignStereo] estimates and removes
+// the delay for a pair already in memory, and [AlignedStereo] is the streaming
+// entry point that aligns and resamples across blocks while keeping its state:
+//
+//	s, err := resampler.NewAlignedStereo(48000, 44100, resampler.QualityHigh,
+//	    resampler.AlignConfig{MaxDelay: 64})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for chunk := range stereoChunks {
+//	    outL, outR, res, err := s.Process(chunk.left, chunk.right)
+//	    if err != nil {
+//	        log.Fatal(err)
+//	    }
+//	    use(outL, outR, res.Valid())
+//	}
+//	tailL, tailR, _, err := s.Flush()
+//
+// The stream's output does not depend on how the input is chunked:
+// re-estimation happens at absolute stream positions every Window samples, and
+// the alignment filters carry their state across blocks. A silent analysis
+// window, a pair that does not correlate, or a delay at the search bound is
+// reported through [AlignResult] and the corresponding sentinel error
+// ([ErrAlignSilent], [ErrAlignUnreliable], [ErrAlignOutOfRange]), and the
+// previous alignment is kept rather than fitted to noise. Polarity is reported,
+// not corrected. Both channels carry a common [AlignedLateness]-sample kernel
+// delay, which shifts the pair's timeline without changing the inter-channel
+// relationship; the stage withholds no samples, so [AlignedStereo.Latency] is
+// the underlying resampler's startup deficit and a FIFO is primed with it as
+// described above (plus AlignedLateness*ratio output samples if the absolute
+// timeline must be preserved).
 //
 // # Parallel Processing
 //
